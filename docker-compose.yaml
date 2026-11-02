@@ -1,0 +1,10 @@
+services:
+  bizbuysell-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — bizbuysell.com answers cloud servers too, so leave this unset.
+      # - BIZBUYSELL_PROXY=http://user:pass@host:port
