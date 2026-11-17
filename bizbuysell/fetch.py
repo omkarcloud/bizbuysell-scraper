@@ -1,9 +1,15 @@
 """BizBuySell transport: plain curl_cffi with browser-impersonated TLS, no
 browser, no cookies kept. Egress: the pod's own IP by default
 (config.bizbuysell_proxy(), knob BIZBUYSELL_EXIT); a block moves every new
-session to the fallback tier (BIZBUYSELL_FALLBACK_EXIT, a sticky
-datacenter proxy exit) for BIZBUYSELL_BLOCK_COOLDOWN seconds. Pod
-probe 2026-10-31 (scrapers-patchright-depl-68b5779f9c-7wt8m,
+session to the fallback tier (BIZBUYSELL_FALLBACK_EXIT; since 2026-11-11
+the shared gateway exit, "gateway", exit_gateway.py: a fresh gateway address on
+nearly every request, numbers in config.py's bizbuysell block) for
+BIZBUYSELL_BLOCK_COOLDOWN seconds. Behind the gateway sits a sticky
+datacenter proxy exit (config.bizbuysell_last_proxy(),
+BIZBUYSELL_LAST_EXIT): a refusal through the gateway moves new sessions
+there for the cooldown, and a call the gateway fails any other way (the
+gateway's own errors, a timeout, 5xx) makes its last retry there, for that
+call only. Pod probe 2026-10-31 (scrapers-patchright-depl-68b5779f9c-7wt8m,
 tools/egress_probe.py): every surface below answers 200 on the pod's own
 IP, on 2/2 datacenter and 2/2 residential ports.
 
@@ -52,6 +58,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   BizBuySellNotFound       unknown listing / franchise / broker — never retried
 """
 import json
+import fastjson
 import os
 import re
 import sys
@@ -65,6 +72,7 @@ import config
 import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from bizbuysell.refs import LANGUAGE_ID, SITE, SITE_ID
+from scraper_utils import responses, sessions
 
 IMPERSONATE = "chrome"
 PAGE_TIMEOUT = 40     # listing pages are ~400 KB
@@ -100,29 +108,35 @@ class BizBuySellNotFound(NotFound):
 
 
 # ---- sessions ----------------------------------------------------------------
-# One session per cheroot worker thread (a curl handle is not thread-safe).
+# One session per cheroot worker thread (a curl handle is not thread-safe;
+# egress.new_session: curl_cffi, or the gateway exit's look-alike).
 # Process-wide: after a block on the default tier every new session rides
-# the fallback tier until _fallback_until.
+# the fallback tier until _fallback_until; after a refusal through the gateway
+# exit, the last tier (a datacenter exit) until _last_until.
 _local = threading.local()
 _fallback_until = 0.0
+_last_until = 0.0
 _fallback_lock = threading.Lock()
 
 
 def _proxy():
+    if getattr(_local, "last_try", False):      # the last retry of a call the gateway kept failing (_retrying)
+        return config.bizbuysell_last_proxy()
     proxy = config.bizbuysell_proxy()
-    if proxy is None and time.time() < _fallback_until:
-        proxy = config.bizbuysell_fallback_proxy()
+    if proxy is None:
+        now = time.time()
+        if now < _last_until:
+            proxy = config.bizbuysell_last_proxy()
+        if proxy is None and now < _fallback_until:
+            proxy = config.bizbuysell_fallback_proxy()
     return proxy
 
 
 def _session():
     sess = getattr(_local, "session", None)
     if sess is None:
-        from curl_cffi import requests as curl_requests
-        proxy = _proxy()
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
+        proxy = _local.exit = _proxy()
+        sess = egress.new_session(proxy, impersonate=IMPERSONATE)     # None, a proxy URL, or the gateway exit ("gateway")
         sess.headers["accept-language"] = egress.accept_language(proxy)
         _local.session = sess
     # Akamai cookies set by an HTML page poison the JSON routes (403), and
@@ -134,35 +148,58 @@ def _session():
     return sess
 
 
+def _on_gateway():
+    """True while the thread's session rides the gateway exit."""
+    return getattr(_local, "session", None) is not None and bool(config.gateway_exit(getattr(_local, "exit", None)))
+
+
 def _drop_session(blocked=False):
     """Close the thread's session (fresh exit next time); a block on the
-    default tier also starts the fallback cooldown for every thread."""
-    global _fallback_until
+    default tier also starts the fallback cooldown for every thread, and a
+    block through the gateway exit the last tier's."""
+    global _fallback_until, _last_until
+    on_gateway = _on_gateway()
     sess = getattr(_local, "session", None)
     _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
-    if blocked and config.bizbuysell_proxy() is None and config.bizbuysell_fallback_proxy() is not None:
+    sessions.close_quietly(sess)
+    if blocked and config.bizbuysell_proxy() is None:
+        until = time.time() + config.BIZBUYSELL_BLOCK_COOLDOWN
         with _fallback_lock:
-            _fallback_until = max(_fallback_until, time.time() + config.BIZBUYSELL_BLOCK_COOLDOWN)
+            if on_gateway and config.bizbuysell_last_proxy() is not None:
+                print(f"bizbuysell: the gateway exit was refused too ({config.BIZBUYSELL_FALLBACK_EXIT}); new sessions on "
+                      f"{config.BIZBUYSELL_LAST_EXIT} for {config.BIZBUYSELL_BLOCK_COOLDOWN} s")
+                _last_until = max(_last_until, until)
+            elif time.time() < _last_until:         # refused on the last tier: stay there on a fresh exit
+                _last_until = max(_last_until, until)
+            elif config.bizbuysell_fallback_proxy() is not None:
+                _fallback_until = max(_fallback_until, until)
 
 
 def _retrying(fn):
     """Run fn() under the shared retry policy (BizBuySellUpstreamError only;
-    NotFound / BadRequest surface immediately)."""
+    NotFound / BadRequest surface immediately). A call whose tries through
+    the gateway exit keep failing makes its LAST retry on
+    config.BIZBUYSELL_LAST_EXIT: the gateway's own errors (its throttle, its
+    29 s timeout) then cost latency, not the call."""
     last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except BizBuySellUpstreamError as e:
-            last = e
-            _drop_session(blocked=isinstance(e, BizBuySellBlocked))
-            if attempt < config.MAX_RETRIES:
-                time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    try:
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                return fn()
+            except BizBuySellUpstreamError as e:
+                last = e
+                on_gateway = _on_gateway()
+                _drop_session(blocked=isinstance(e, BizBuySellBlocked))
+                if attempt < config.MAX_RETRIES:
+                    # the session _session() builds next
+                    _local.last_try = (on_gateway and attempt + 1 == config.MAX_RETRIES
+                                       and config.bizbuysell_last_proxy() is not None)
+                    time.sleep(config.RETRY_BACKOFF * attempt)
+        raise last
+    finally:
+        if getattr(_local, "last_try", False):
+            _local.last_try = False
+            _drop_session()         # the next call starts on the thread's own tier again
 
 
 # ---- request helpers -----------------------------------------------------------
@@ -191,15 +228,7 @@ def _looks_challenged(text):
 
 
 def _classify(resp, label):
-    if resp.status_code == 404:
-        raise BizBuySellNotFound(f"{label} not found")
-    if resp.status_code == 400:
-        raise BizBuySellBadRequest(resp.text[:200])
-    if resp.status_code in (401, 403, 429):
-        raise BizBuySellBlocked(f"HTTP {resp.status_code} for {label}")
-    if resp.status_code != 200:
-        raise BizBuySellUpstreamError(f"HTTP {resp.status_code} for {label}")
-    return resp.text
+    return responses.classify(resp, label, BizBuySellNotFound, BizBuySellBadRequest, BizBuySellBlocked, BizBuySellUpstreamError)
 
 
 def _post_json(path, body, label, method="POST"):
@@ -220,7 +249,7 @@ def _post_json(path, body, label, method="POST"):
         if _looks_challenged(text):
             raise BizBuySellBlocked(f"challenge page for {label}")
         try:
-            payload = json.loads(text)
+            payload = fastjson.loads(text)
         except ValueError:
             raise BizBuySellBlocked(f"non-JSON response for {label}: {text[:120]!r}")
         if not isinstance(payload, dict):

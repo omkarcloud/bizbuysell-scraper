@@ -39,13 +39,14 @@ page, one broker account, a typeahead, a franchise search page, a
 past-the-end franchise page, the Lawn Doctor brochure, the unknown-franchise
 answer, the category list and a county sample.
 """
-import json
+import fastjson
 import re
 
 from bs4 import BeautifulSoup
 
 from bizbuysell import refs
 from bizbuysell.refs import IMAGE_HOST, SITE
+from scraper_utils.values import to_int as _int
 
 _NOT_DISCLOSED = {"", "not disclosed", "n/a", "na", "-", "none", "null"}
 _NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
@@ -89,13 +90,6 @@ def _money(value):
     """A non-positive amount is the site's "not disclosed" placeholder."""
     number = _number(value)
     return number if number is not None and number > 0 else None
-
-
-def _int(value):
-    try:
-        return int(value) if value is not None and not isinstance(value, bool) else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _bool(value):
@@ -268,7 +262,7 @@ def _ld_json(soup):
     blocks = {}
     for script in soup.select('script[type="application/ld+json"]'):
         try:
-            data = json.loads(script.string or "")
+            data = fastjson.loads(script.string or "")
         except ValueError:
             continue
         if isinstance(data, dict) and data.get("@type"):
@@ -345,7 +339,7 @@ def _tracking(html):
     if not match:
         return {}
     try:
-        return json.loads(match.group(1))
+        return fastjson.loads(match.group(1))
     except ValueError:
         return {}
 
